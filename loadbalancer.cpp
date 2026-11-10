@@ -1,202 +1,366 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <thread>
+#include <sstream>
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
+#include <cerrno>
+#include <functional>
 
+#include <unistd.h>
+#include <signal.h>
 #include <sys/socket.h>
-#include <sys/mman.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
-#include <signal.h>
+#include <sys/select.h>
+#include <fcntl.h>
 
-// Number of backend servers
-const int SERVER_COUNT = 3;
-
-// Load balancer port
-const int LOAD_BALANCER_PORT = 8000;
-
-// Backend server ports
-int backendPorts[SERVER_COUNT] = {9001, 9002, 9003};
-
-// Round Robin pointer
-int currentServer = 0;
-
-// Shared active connection counters
-int *activeConnections;
-
-// Selected algorithm
-int algorithm;
-
-// Convert string to integer
-int stringToInt(char text[])
+using namespace std;
+// 1. SERVER STRUCTURE
+struct Server
 {
-    int number = 0;
-    int i = 0;
+    int port;
+    pid_t processID;
+    int activeConnections;
+    bool active;
+};
+// 2. LOAD BALANCING ALGORITHMS
+enum Algorithm
+{
+    ROUND_ROBIN,
+    IP_HASH,
+    LEAST_CONNECTIONS
+};
 
-    if (text[0] == '\0')
-        return -1;
+// Custom IP hash function
+unsigned long hashIP(const string& ip)
+{
+    unsigned long hash = 5381;
 
-    while (text[i] != '\0')
+    for (char c : ip)
     {
-        if (text[i] < '0' || text[i] > '9')
-            return -1;
-
-        number = number * 10 + (text[i] - '0');
-        i++;
+        hash = ((hash << 5) + hash) + c;
     }
 
-    return number;
+    return hash;
 }
-
-// Print a string
-void printText(const char text[])
+// 3. SERVER MANAGER
+class ServerManager
 {
-    int i = 0;
+private:
 
-    while (text[i] != '\0')
+    vector<Server> servers;
+
+    mutex serverMutex;
+
+    int nextPort = 8081;
+
+    int roundRobinIndex = 0;
+
+public:
+    // ADD SERVER
+    bool addServer()
     {
-        write(1, &text[i], 1);
-        i++;
-    }
-}
+        int port;
 
-// Print an integer
-void printNumber(int number)
-{
-    char digits[12];
-    int i = 0;
-
-    if (number == 0)
-    {
-        write(1, "0", 1);
-        return;
-    }
-
-    while (number > 0)
-    {
-        digits[i] = (number % 10) + '0';
-        number /= 10;
-        i++;
-    }
-
-    while (i > 0)
-    {
-        i--;
-        write(1, &digits[i], 1);
-    }
-}
-
-// Send all bytes
-int sendAll(int socket, const char message[], int length)
-{
-    int sent = 0;
-
-    while (sent < length)
-    {
-        int result = send(
-            socket,
-            message + sent,
-            length - sent,
-            0
-        );
-
-        if (result <= 0)
-            return -1;
-
-        sent += result;
-    }
-
-    return sent;
-}
-
-// Remove finished child processes
-void reapChildren(int signalNumber)
-{
-    (void)signalNumber;
-
-    while (waitpid(-1, 0, WNOHANG) > 0)
-    {
-        // Reap all finished child processes
-    }
-}
-
-// Select backend using Round Robin
-int roundRobin()
-{
-    int selected = currentServer;
-
-    currentServer++;
-
-    if (currentServer == SERVER_COUNT)
-        currentServer = 0;
-
-    return selected;
-}
-
-// Select backend using Least Connections
-int leastConnections()
-{
-    int selected = currentServer;
-    int minimum = activeConnections[selected];
-
-    // Check all backend servers
-    for (int i = 1; i < SERVER_COUNT; i++)
-    {
-        int index = (currentServer + i) % SERVER_COUNT;
-
-        if (activeConnections[index] < minimum)
         {
-            minimum = activeConnections[index];
-            selected = index;
+            lock_guard<mutex> lock(serverMutex);
+            port = nextPort++;
+        }
+
+        string portText = to_string(port);
+
+        // Create a new backend process
+        pid_t pid = fork();
+
+        if (pid < 0)
+        {
+            perror("Fork failed");
+            return false;
+        }
+
+        if (pid == 0)
+        {
+            // Child process executes backend program
+            execl("./backend", "./backend", portText.c_str(), (char*)NULL);
+            perror("Backend execution failed");
+            _exit(127);
+        }
+
+        // Wait until the backend is ready
+        bool ready = false;
+
+        for (int i = 0; i < 30; i++)
+        {
+            int testSocket = socket(
+                AF_INET, SOCK_STREAM, 0
+            );
+
+            if (testSocket < 0)
+                break;
+
+            sockaddr_in address{};
+
+            address.sin_family = AF_INET;
+            address.sin_port = htons(port);
+
+            inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+
+            if (connect(testSocket, (sockaddr*)&address, sizeof(address)) == 0)
+            {
+                ready = true;
+                close(testSocket);
+                break;
+            }
+
+            close(testSocket);
+            usleep(100000);
+        }
+
+        if (!ready)
+        {
+            cout << "Backend failed to start on port " << port << endl;
+
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
+
+            return false;
+        }
+
+        // Register the server
+        {
+            lock_guard<mutex> lock(serverMutex);
+
+            servers.push_back({port, pid, 0, true});
+        }
+
+        cout << "Server added successfully!" << " Port: " << port << " PID: " << pid << endl;
+
+        return true;
+    }
+
+    // REMOVE SERVER
+
+    bool removeServer(int port)
+    {
+        pid_t pid = -1;
+
+        {
+            lock_guard<mutex> lock(serverMutex);
+
+            for (auto it = servers.begin();
+                 it != servers.end(); ++it)
+            {
+                if (it->port == port && it->active)
+                {
+                    // Do not kill a server with
+                    // requests currently in progress.
+                    if (it->activeConnections > 0)
+                    {
+                        cout << "Server has active " << "connections. Try again later.\n";
+
+                        return false;
+                    }
+
+                    pid = it->processID;
+
+                    servers.erase(it);
+
+                    break;
+                }
+            }
+        }
+
+        if (pid == -1)
+        {
+            cout << "Server not found!\n";
+            return false;
+        }
+
+        kill(pid, SIGTERM);
+
+        waitpid(pid, NULL, 0);
+
+        cout << "Server removed from port " << port << endl;
+
+        return true;
+    }
+
+    // GET ACTIVE SERVER COUNT
+
+    int getServerCount()
+    {
+        lock_guard<mutex> lock(serverMutex);
+
+        return servers.size();
+    }
+
+    // DISPLAY SERVER INFORMATION
+
+    void displayServers()
+    {
+        lock_guard<mutex> lock(serverMutex);
+
+        cout << "\n========== SERVER STATUS ==========\n";
+
+        cout << "PORT\tPID\tCONNECTIONS\tSTATUS\n";
+
+        for (const auto& server : servers)
+        {
+            cout << server.port << "\t" << server.processID << "\t" << server.activeConnections << "\t\t" << (server.active ? "ACTIVE" : "INACTIVE") << endl;
+        }
+
+        cout << "Total servers: " << servers.size() << endl;
+
+        cout << "===================================\n";
+    }
+
+    // SELECT SERVER USING AN ALGORITHM
+
+    bool selectServer(
+        Algorithm algorithm,
+        const string& clientIP,
+        Server& selected
+    )
+    {
+        lock_guard<mutex> lock(serverMutex);
+
+        vector<int> available;
+
+        for (int i = 0; i < (int)servers.size(); i++)
+        {
+            if (servers[i].active)    available.push_back(i);
+        }
+
+        if (available.empty()) return false;
+
+        int selectedIndex = available[0];
+
+        // ROUND ROBIN
+        if (algorithm == ROUND_ROBIN)
+        {
+            int position =
+                roundRobinIndex % available.size();
+
+            selectedIndex = available[position];
+
+            roundRobinIndex++;
+        }
+
+        // IP HASH
+        else if (algorithm == IP_HASH)
+        {
+            unsigned long hash = hashIP(clientIP);
+
+            int position = hash % available.size();
+
+            selectedIndex = available[position];
+        }
+
+        // LEAST CONNECTIONS
+        else if (algorithm == LEAST_CONNECTIONS)
+        {
+            for (int index : available)
+            {
+                if (servers[index].activeConnections <
+                    servers[selectedIndex].activeConnections)
+                {
+                    selectedIndex = index;
+                }
+            }
+        }
+
+        // Increase active connection count
+        servers[selectedIndex].activeConnections++;
+
+        selected = servers[selectedIndex];
+
+        return true;
+    }
+
+    // DECREASE ACTIVE CONNECTION COUNT
+
+    void releaseConnection(pid_t pid)
+    {
+        lock_guard<mutex> lock(serverMutex);
+
+        for (auto& server : servers)
+        {
+            if (server.processID == pid)
+            {
+                if (server.activeConnections > 0)
+                    server.activeConnections--;
+
+                return;
+            }
         }
     }
 
-    // Rotate the starting point to break ties fairly
-    currentServer = (selected + 1) % SERVER_COUNT;
+    // STOP ALL BACKEND SERVERS
 
-    return selected;
-}
-
-// Select backend using IP Hash
-int ipHash(unsigned int clientIP)
-{
-    return clientIP % SERVER_COUNT;
-}
-
-// Choose an algorithm
-int selectBackend(unsigned int clientIP)
-{
-    if (algorithm == 1)
-        return roundRobin();
-
-    if (algorithm == 2)
-        return leastConnections();
-
-    if (algorithm == 3)
-        return ipHash(clientIP);
-
-    return -1;
-}
-
-// Connect to selected backend
-int connectToBackend(int port)
-{
-    int backendSocket;
-
-    struct sockaddr_in backendAddress = {};
-
-    backendSocket = socket(AF_INET, SOCK_STREAM, 0);
-
-    if (backendSocket < 0)
-        return -1;
-
-    backendAddress.sin_family = AF_INET;
-    backendAddress.sin_port = htons(port);
-    backendAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (connect(
-            backendSocket,
-            (struct sockaddr *)&backendAddress,
-            sizeof(backendAddress)) < 0)
+    void stopAll()
     {
+        vector<pid_t> processes;
+
+        {
+            lock_guard<mutex> lock(serverMutex);
+
+            for (const auto& server : servers)
+            {
+                processes.push_back(server.processID);
+            }
+
+            servers.clear();
+        }
+
+        for (pid_t pid : processes)
+        {
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
+        }
+
+        cout << "All backend servers stopped.\n";
+    }
+};
+// 4. SEND ALL DATA
+bool sendAll(int socketFD, const string& message)
+{
+    size_t totalSent = 0;
+
+    while (totalSent < message.size())
+    {
+        ssize_t sent = send(socketFD, message.c_str() + totalSent, message.size() - totalSent, 0);
+
+        if (sent <= 0) return false;
+
+        totalSent += sent;
+    }
+
+    return true;
+}
+// 5. CONNECT TO BACKEND
+int connectBackend(int port)
+{
+    int backendSocket = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (backendSocket < 0) return -1;
+
+    // Prevent this descriptor from leaking
+    // into dynamically created backend processes.
+    fcntl(backendSocket, F_SETFD, FD_CLOEXEC);
+
+    sockaddr_in address{};
+
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+
+    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+
+    if (connect(backendSocket, (sockaddr*)&address, sizeof(address)) < 0){
         close(backendSocket);
         return -1;
     }
@@ -204,277 +368,314 @@ int connectToBackend(int port)
     return backendSocket;
 }
 
-// Handle one client in a child process
-void handleClient(int clientSocket, int selected)
+// 6. HANDLE CLIENT REQUEST
+
+void handleClient(
+    int clientSocket,
+    string clientIP,
+    ServerManager& manager,
+    Algorithm algorithm
+)
 {
-    char request[4096];
-    int totalBytes = 0;
+    char buffer[4096];
 
-    // Receive request from client
-    while (totalBytes < 4095)
+    string request;
+
+    // Receive complete client request
+    while (true)
     {
-        int received = recv(
-            clientSocket,
-            request + totalBytes,
-            4095 - totalBytes,
-            0
-        );
+        ssize_t received = recv( clientSocket, buffer, sizeof(buffer), 0);
 
-        if (received < 0)
-        {
-            close(clientSocket);
-            return;
-        }
-
-        if (received == 0)
+        if (received <= 0)
             break;
 
-        totalBytes += received;
+        request.append(buffer, received);
     }
 
-    if (totalBytes == 0 || totalBytes == 4095)
+    if (request.empty())
     {
-        char errorMessage[] = "Invalid or oversized request";
-        sendAll(clientSocket, errorMessage,
-                sizeof(errorMessage) - 1);
         close(clientSocket);
         return;
     }
 
-    request[totalBytes] = '\0';
+    // Select backend server
+    Server selected;
+
+    if (!manager.selectServer(algorithm, clientIP, selected))
+    {
+        sendAll(clientSocket, "ERROR: No active backend servers.\n");
+
+        close(clientSocket);
+        return;
+    }
+
+    cout << "\nClient: " << clientIP << " -> Backend: " << selected.port << endl;
 
     // Connect to selected backend
-    int backendSocket = connectToBackend(
-        backendPorts[selected]
-    );
+    int backendSocket = connectBackend(selected.port);
 
     if (backendSocket < 0)
     {
-        char errorMessage[] =
-            "Error: Backend server unavailable";
+        sendAll( clientSocket, "ERROR: Backend connection failed.\n");
 
-        sendAll(clientSocket, errorMessage,
-                sizeof(errorMessage) - 1);
+        manager.releaseConnection(selected.processID);
 
         close(clientSocket);
         return;
     }
 
-    // Forward client request
-    if (sendAll(backendSocket, request, totalBytes) < 0)
-    {
-        close(backendSocket);
-        close(clientSocket);
-        return;
-    }
+    // Forward request to backend
+    bool success = sendAll(backendSocket, request);
 
-    // Tell backend request is complete
+    // Tell backend that request transmission is complete
     shutdown(backendSocket, SHUT_WR);
 
-    // Receive and forward backend response
-    char response[1024];
-    int received;
+    // Receive backend response
+    string response;
 
-    while ((received = recv(
-                backendSocket,
-                response,
-                sizeof(response),
-                0)) > 0)
+    while (true)
     {
-        if (sendAll(clientSocket, response, received) < 0)
+        ssize_t received = recv(backendSocket, buffer, sizeof(buffer), 0);
+
+        if (received <= 0)
             break;
+
+        response.append(buffer, received);
+    }
+
+    // Forward response to original client
+    if (success && !response.empty())
+    {
+        sendAll(clientSocket, response);
+    }
+    else
+    {
+        sendAll(clientSocket, "ERROR: Backend did not respond correctly.\n");
     }
 
     close(backendSocket);
     close(clientSocket);
-}
 
-int main(int argc, char *argv[])
+    // Release active connection
+    manager.releaseConnection(selected.processID);
+}
+// 7. MAIN LOAD BALANCER
+int main(int argc, char* argv[])
 {
-    // Step 1: Read algorithm selection
     if (argc != 2)
     {
-        printText("Choose an algorithm:\n");
-        printText("1. Round Robin\n");
-        printText("2. Least Connections\n");
-        printText("3. IP Hash\n");
-        printText("Usage: ./loadbalancer <1|2|3>\n");
+        cout << "Usage:\n";
+        cout << "./loadbalancer roundrobin\n";
+        cout << "./loadbalancer iphash\n";
+        cout << "./loadbalancer leastconnections\n";
 
         return 1;
     }
 
-    algorithm = stringToInt(argv[1]);
+    // Ignore broken pipe signals
+    signal(SIGPIPE, SIG_IGN);
 
-    if (algorithm < 1 || algorithm > 3)
+    // Select algorithm
+    string choice = argv[1];
+
+    Algorithm algorithm;
+
+    if (choice == "roundrobin")
+        algorithm = ROUND_ROBIN;
+
+    else if (choice == "iphash")
+        algorithm = IP_HASH;
+
+    else if (choice == "leastconnections")
+        algorithm = LEAST_CONNECTIONS;
+
+    else
     {
-        printText("Invalid algorithm choice\n");
+        cout << "Invalid algorithm!\n";
         return 1;
     }
 
-    // Step 2: Create shared memory for active connections
-    activeConnections = (int *)mmap(
-        0,
-        sizeof(int) * SERVER_COUNT,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED | MAP_ANONYMOUS,
-        -1,
-        0
+    cout << "Selected Algorithm: "
+         << choice << endl;
+
+    // Create Server Manager
+    ServerManager manager;
+
+    // Start three initial backend servers
+    cout << "\nStarting backend servers...\n";
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (!manager.addServer())
+        {
+            manager.stopAll();
+            return 1;
+        }
+    }
+
+    // Create load balancer socket
+    int serverSocket = socket(
+        AF_INET, SOCK_STREAM, 0
     );
-
-    if (activeConnections == MAP_FAILED)
-    {
-        printText("Shared memory creation failed\n");
-        return 1;
-    }
-
-    // Initialize connection counters
-    for (int i = 0; i < SERVER_COUNT; i++)
-        activeConnections[i] = 0;
-
-    // Step 3: Handle finished child processes
-    signal(SIGCHLD, reapChildren);
-
-    // Step 4: Create load balancer socket
-    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
 
     if (serverSocket < 0)
     {
-        printText("Socket creation failed\n");
-        munmap(activeConnections,
-               sizeof(int) * SERVER_COUNT);
+        perror("Socket creation failed");
+        manager.stopAll();
         return 1;
     }
 
-    // Allow port reuse
+    fcntl(serverSocket, F_SETFD, FD_CLOEXEC);
+
     int option = 1;
 
-    setsockopt(
-        serverSocket,
-        SOL_SOCKET,
-        SO_REUSEADDR,
-        &option,
-        sizeof(option)
-    );
+    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
 
-    // Step 5: Configure load balancer address
-    struct sockaddr_in serverAddress = {};
+    sockaddr_in address{};
 
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(LOAD_BALANCER_PORT);
-    serverAddress.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_family = AF_INET;
+    address.sin_port = htons(8080);
+    address.sin_addr.s_addr = INADDR_ANY;
 
-    // Step 6: Bind socket
-    if (bind(
-            serverSocket,
-            (struct sockaddr *)&serverAddress,
-            sizeof(serverAddress)) < 0)
+    // Bind load balancer to port 8080
+    if (bind(serverSocket, (sockaddr*)&address, sizeof(address)) < 0)
     {
-        printText("Binding failed\n");
+        perror("Load balancer bind failed");
+
         close(serverSocket);
-        munmap(activeConnections,
-               sizeof(int) * SERVER_COUNT);
+        manager.stopAll();
+
         return 1;
     }
 
-    // Step 7: Start listening
+    // Listen for clients
     if (listen(serverSocket, 20) < 0)
     {
-        printText("Listen failed\n");
+        perror("Listen failed");
+
         close(serverSocket);
-        munmap(activeConnections,
-               sizeof(int) * SERVER_COUNT);
+        manager.stopAll();
+
         return 1;
     }
 
-    printText("Load Balancer running on port 8000\n");
-    printText("Selected algorithm: ");
+    cout << "\nLoad Balancer running on port 8080\n";
 
-    if (algorithm == 1)
-        printText("Round Robin\n");
-    else if (algorithm == 2)
-        printText("Least Connections\n");
-    else
-        printText("IP Hash\n");
+    cout << "\nADMIN COMMANDS:\n";
+    cout << "add              - Add backend server\n";
+    cout << "remove <port>    - Remove backend server\n";
+    cout << "list             - Display servers\n";
+    cout << "quit             - Stop load balancer\n";
 
-    // Step 8: Accept clients continuously
-    while (1)
+    // Store client threads
+    vector<thread> clientThreads;
+
+    bool running = true;
+
+    while (running)
     {
-        struct sockaddr_in clientAddress = {};
-        socklen_t clientLength = sizeof(clientAddress);
+        fd_set readfds;
 
-        int clientSocket = accept(
-            serverSocket,
-            (struct sockaddr *)&clientAddress,
-            &clientLength
+        FD_ZERO(&readfds);
+
+        FD_SET(serverSocket, &readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+
+        int maxFD = max(serverSocket, STDIN_FILENO);
+
+        // Wait for client connections or admin commands
+        int activity = select(maxFD + 1, &readfds, NULL, NULL, NULL
         );
 
-        if (clientSocket < 0)
-            continue;
-
-        // Convert client IP to host byte order
-        unsigned int clientIP =
-            ntohl(clientAddress.sin_addr.s_addr);
-
-        // Step 9: Select backend
-        int selected = selectBackend(clientIP);
-
-        // Increment active connection count atomically
-        __sync_add_and_fetch(
-            &activeConnections[selected], 1
-        );
-
-        printText("\nSelected Backend Server ");
-        printNumber(selected + 1);
-        printText(" (Port ");
-        printNumber(backendPorts[selected]);
-        printText(")\n");
-
-        if (algorithm == 2)
+        if (activity < 0)
         {
-            printText("Active connections: ");
+            if (errno == EINTR)
+                continue;
 
-            for (int i = 0; i < SERVER_COUNT; i++)
+            perror("Select failed");
+            break;
+        }
+
+        // Process administrator commands
+        if (FD_ISSET(STDIN_FILENO, &readfds))
+        {
+            string command;
+
+            if (!getline(cin, command))
             {
-                printNumber(activeConnections[i]);
-                printText(" ");
+                running = false;
+                continue;
             }
 
-            printText("\n");
+            if (command == "add")
+            {
+                manager.addServer();
+            }
+
+            else if (command == "list")
+            {
+                manager.displayServers();
+            }
+
+            else if (command == "quit")
+            {
+                running = false;
+            }
+
+            else if (command.rfind("remove ", 0) == 0)
+            {
+                int port = atoi(
+                    command.substr(7).c_str()
+                );
+
+                manager.removeServer(port);
+            }
+
+            else
+            {
+                cout << "Unknown command!\n";
+            }
         }
 
-        // Step 10: Create child process
-        int processID = fork();
-
-        if (processID < 0)
+        // Accept client connections
+        if (running && FD_ISSET(serverSocket, &readfds))
         {
-            printText("Process creation failed\n");
+            sockaddr_in clientAddress{};
 
-            __sync_sub_and_fetch(
-                &activeConnections[selected], 1
-            );
+            socklen_t clientLength =
+                sizeof(clientAddress);
 
-            close(clientSocket);
-            continue;
+            int clientSocket = accept(serverSocket, (sockaddr*)&clientAddress, &clientLength);
+
+            if (clientSocket >= 0)
+            {
+                fcntl(clientSocket, F_SETFD, FD_CLOEXEC);
+
+                char ip[INET_ADDRSTRLEN] = {};
+
+                inet_ntop(AF_INET, &clientAddress.sin_addr, ip, sizeof(ip));
+
+                // Handle every client in a separate thread
+                clientThreads.emplace_back(handleClient, clientSocket, string(ip), ref(manager), algorithm);
+            }
         }
-
-        if (processID == 0)
-        {
-            // Child process
-            close(serverSocket);
-
-            handleClient(clientSocket, selected);
-
-            // Decrease active connection count
-            __sync_sub_and_fetch(
-                &activeConnections[selected], 1
-            );
-
-            _exit(0);
-        }
-
-        // Parent process
-        close(clientSocket);
     }
+
+    cout << "\nShutting down load balancer...\n";
+
+    close(serverSocket);
+
+    // Wait for all client handlers to finish
+    for (auto& t : clientThreads)
+    {
+        if (t.joinable())
+            t.join();
+    }
+
+    // Terminate backend processes
+    manager.stopAll();
+
+    cout << "Load Balancer stopped.\n";
 
     return 0;
 }
